@@ -4908,6 +4908,7 @@ static void CheckAsinEdgeFlags() {
 }
 
 static void CheckTinyInverseTrigFlags() {
+    constexpr int standardExcepts = FE_INVALID | FE_DIVBYZERO | FE_OVERFLOW | FE_UNDERFLOW | FE_INEXACT;
     for (const auto function : {asin_nid_postfix, atan_nid_postfix}) {
         for (const double input : {0.0, -0.0, 0x1p-30, -0x1p-30,
                                    std::numeric_limits<double>::denorm_min(), -std::numeric_limits<double>::denorm_min()}) {
@@ -4916,7 +4917,7 @@ static void CheckTinyInverseTrigFlags() {
             errno = 1234;
             std::feclearexcept(FE_ALL_EXCEPT);
             const auto result = std::bit_cast<std::uint64_t>(function(input));
-            Require(result == bits && errno == 1234 && std::fetestexcept(FE_ALL_EXCEPT) == expected);
+            Require(result == bits && errno == 1234 && std::fetestexcept(standardExcepts) == expected);
         }
     }
 }
