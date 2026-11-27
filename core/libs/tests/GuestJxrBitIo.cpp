@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -359,6 +360,24 @@ std::int64_t APS5_VABI AttachmentPosition(Jxr::Stream* stream, std::size_t* posi
     return positionResult;
 }
 
+std::uintptr_t hostWriteTestPage = 0;
+std::size_t hostWriteTestPageBytes = 0;
+
+void MakeHostWritePageWritable(std::uintptr_t address, std::size_t bytes) {
+    if (hostWriteTestPage == 0 || address > UINTPTR_MAX - bytes) return;
+    const auto end = address + bytes;
+    if (address >= hostWriteTestPage + hostWriteTestPageBytes || hostWriteTestPage >= end) return;
+#ifdef _WIN32
+    DWORD ignored = 0;
+    Require(VirtualProtect(reinterpret_cast<void*>(hostWriteTestPage), hostWriteTestPageBytes, PAGE_READWRITE, &ignored) != 0,
+            "host-write hook opens the tracked page");
+#else
+    Require(mprotect(reinterpret_cast<void*>(hostWriteTestPage), hostWriteTestPageBytes, PROT_READ | PROT_WRITE) == 0,
+            "host-write hook opens the tracked page");
+#endif
+    errno = 92;
+}
+
 void RunAttachWrite() {
     alignas(Jxr::BitIo) std::array<std::uint8_t, 8192 + sizeof(Jxr::BitIo) + 16> storage;
     storage.fill(0xa5);
@@ -402,6 +421,69 @@ void RunAttachWrite() {
     RequireInvalidArgument([&] { attachISWrite_nid_postfix(io, nullptr); }, "attachment needs a stream");
     RequireInvalidArgument([&] { attachISWrite_nid_postfix(nullptr, &stream); }, "attachment needs bit state");
     std::destroy_at(io);
+}
+
+void RunAttachWriteHostWriteHookErrno() {
+    constexpr std::size_t GuestBytes = 0x4000;
+    auto* guest = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(GuestBytes, RingAlignment));
+    Require(guest != nullptr, "allocate guest bit state for host-write errno test");
+#ifdef _WIN32
+    constexpr std::uint32_t ReadWriteProtection = PAGE_READWRITE;
+#else
+    constexpr std::uint32_t ReadWriteProtection = PROT_READ | PROT_WRITE;
+#endif
+    GuestArena::GuestArenaCommit_nid_postfix(guest, GuestBytes, ReadWriteProtection, 4096);
+    auto* io = reinterpret_cast<Jxr::BitIo*>(guest + 8192);
+    std::memset(io, 0x5c, sizeof(*io));
+    io->bitsUsed = 13;
+    io->mask = 37;
+    io->referenceOffset = 12345;
+    io->shadow = 0x89abcdef;
+    Jxr::Stream stream{};
+    stream.getPosition = &AttachmentPosition;
+    attachingIo = io;
+    attachingStream = &stream;
+    positionResult = 0;
+    storePosition = true;
+    throwPosition = false;
+    positionCalls = 0;
+    hostWriteTestPage = reinterpret_cast<std::uintptr_t>(io);
+    hostWriteTestPageBytes = 4096;
+#ifdef _WIN32
+    DWORD oldProtection = 0;
+    Require(VirtualProtect(reinterpret_cast<void*>(hostWriteTestPage), hostWriteTestPageBytes, PAGE_READONLY, &oldProtection) != 0,
+            "protect guest bit state before host-write errno test");
+#else
+    Require(mprotect(reinterpret_cast<void*>(hostWriteTestPage), hostWriteTestPageBytes, PROT_READ) == 0,
+            "protect guest bit state before host-write errno test");
+#endif
+    Require(!GuestWritable_nid_no_patch(io, sizeof(*io)), "guest bit state is read-only before host-write hook");
+    GuestArena::GuestArenaSetHostWriteHook_nid_no_patch(MakeHostWritePageWritable);
+    errno = 71;
+    const auto result = attachISWrite_nid_postfix(io, &stream);
+    const int observedErrno = errno;
+    GuestArena::GuestArenaSetHostWriteHook_nid_no_patch(nullptr);
+#ifdef _WIN32
+    DWORD ignoredProtection = 0;
+    const bool restored = VirtualProtect(reinterpret_cast<void*>(hostWriteTestPage), hostWriteTestPageBytes, PAGE_READWRITE, &ignoredProtection) != 0;
+#else
+    const bool restored = mprotect(reinterpret_cast<void*>(hostWriteTestPage), hostWriteTestPageBytes, PROT_READ | PROT_WRITE) == 0;
+#endif
+    hostWriteTestPage = 0;
+    hostWriteTestPageBytes = 0;
+    Require(restored, "restore guest bit-state page after host-write errno test");
+    Require(result == 0, "attachISWrite accepts the write-tracked guest bit state");
+    Require(observedErrno == 71, "attachISWrite preserves errno across the host-write hook");
+    Require(positionCalls == 1, "host-write errno attachment queries position once");
+    Require(io->referenceOffset == std::numeric_limits<std::size_t>::max() - 17 && io->shadow == 0x76543210,
+            "host-write errno attachment preserves callback mutations");
+    Require(io->start == guest && io->current == guest, "host-write errno attachment locates packet buffer");
+    Require(io->accumulator == 0 && io->bitsUsed == 0 && io->mask == WriteMask && io->stream == &stream,
+            "host-write errno attachment initializes writer state");
+    attachingIo = nullptr;
+    attachingStream = nullptr;
+    GuestArena::GuestArenaReset_nid_postfix(guest, GuestBytes);
+    GuestArena::GuestArenaRelease_nid_postfix(guest, GuestBytes);
 }
 
 void RunReads() {
@@ -629,6 +711,7 @@ void RunEdges() {
 int main() {
     RunAttachReadEdges();
     RunAttachWrite();
+    RunAttachWriteHostWriteHookErrno();
     RunReads();
     RunWrites();
     RunDetachRead();
