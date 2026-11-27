@@ -508,5 +508,57 @@ class SourceCodeBlankingTests(unittest.TestCase):
                          ("sceExampleSplit", "out", 3, ["dereference"]))
 
 
+class HostWriteAuditTests(unittest.TestCase):
+    def test_flags_unguarded_guest_writable_call(self):
+        source = (
+            "int APS5_VABI sceExample(void* out) {\n"
+            "  if (!GuestWritable_nid_no_patch(out, 4)) return -1;\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        entries = guest_pointer_audit.audit_host_write_text(guest_pointer_audit.source_code(source))
+        self.assertEqual(entries, [{"line": 2}])
+
+    def test_accepts_enclosing_host_write_in_same_or_outer_scope(self):
+        source = (
+            "int APS5_VABI sceSameScope(void* out) {\n"
+            "  const GuestArena::HostWrite guard(out, 4);\n"
+            "  return guard.Open() && GuestWritable_nid_no_patch(out, 4) ? 0 : -1;\n"
+            "}\n"
+            "int APS5_VABI sceOuterScope(void* out, bool flag) {\n"
+            "  const GuestArena::HostWrite guard(out, 4);\n"
+            "  if (flag) {\n"
+            "    if (!guard.Open() || !GuestWritable_nid_no_patch(out, 4)) return -1;\n"
+            "  }\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        entries = guest_pointer_audit.audit_host_write_text(guest_pointer_audit.source_code(source))
+        self.assertEqual(entries, [])
+
+    def test_ignores_host_write_in_closed_sibling_block_or_previous_function(self):
+        source = (
+            "void Helper(void* p) {\n"
+            "  const GuestArena::HostWrite guard(p, 4);\n"
+            "}\n"
+            "int APS5_VABI sceSibling(void* out) {\n"
+            "  { const GuestArena::HostWrite guard(out, 4); }\n"
+            "  return GuestWritable_nid_no_patch(out, 4) ? 0 : -1;\n"
+            "}\n"
+        )
+        entries = guest_pointer_audit.audit_host_write_text(guest_pointer_audit.source_code(source))
+        self.assertEqual(entries, [{"line": 6}])
+
+    def test_ignores_declaration_and_definition(self):
+        source = (
+            'extern "C" bool GuestWritable_nid_no_patch(void* dst, size_t bytes);\n'
+            'extern "C" bool GuestWritable_nid_no_patch(void* dst, size_t bytes) {\n'
+            "  return true;\n"
+            "}\n"
+        )
+        entries = guest_pointer_audit.audit_host_write_text(guest_pointer_audit.source_code(source))
+        self.assertEqual(entries, [])
+
+
 if __name__ == "__main__":
     unittest.main()

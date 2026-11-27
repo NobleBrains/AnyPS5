@@ -57,6 +57,9 @@ _CODE_TOKEN = re.compile(r"(?:[0-9]|\.[0-9])[A-Za-z0-9_.']*|[A-Za-z_][A-Za-z0-9_
 _PRE_TOKEN_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.'")
 _STRING_PREFIXES = frozenset(("u8", "u", "U", "L"))
 _RAW_PREFIXES = frozenset(("R", "u8R", "uR", "UR", "LR"))
+_GUEST_WRITABLE_CALL = re.compile(r"\bGuestWritable_nid_no_patch\s*\(")
+_HOST_WRITE_GUARD = re.compile(r"\b(?:HostWrite|GuestArenaBeginHostWrite_nid_postfix)\b")
+_GUEST_WRITABLE_DECL = re.compile(r"\bbool\s+$")
 
 
 def split_top_level(text, angles=True):
@@ -523,6 +526,56 @@ def _library_sources(library):
     return sources
 
 
+def _has_enclosing_host_write(text, call_start):
+    skip_depth = 0
+    in_scope_chunks = []
+    chunk_end = call_start
+    for index in range(call_start - 1, -1, -1):
+        ch = text[index]
+        if ch == "}":
+            if skip_depth == 0 and index + 1 < chunk_end:
+                in_scope_chunks.append(text[index + 1:chunk_end])
+            skip_depth += 1
+        elif ch == "{":
+            if skip_depth > 0:
+                skip_depth -= 1
+                if skip_depth == 0:
+                    chunk_end = index
+    if skip_depth == 0 and chunk_end > 0:
+        in_scope_chunks.append(text[:chunk_end])
+    return any(_HOST_WRITE_GUARD.search(chunk) is not None for chunk in in_scope_chunks)
+
+
+def audit_host_write_text(text):
+    results = []
+    line_pos = 0
+    line_base = 1
+    for match in _GUEST_WRITABLE_CALL.finditer(text):
+        pos = match.start()
+        prefix = text[max(0, pos - 16):pos]
+        if _GUEST_WRITABLE_DECL.search(prefix) is not None:
+            continue
+        if _has_enclosing_host_write(text, pos):
+            continue
+        line_base += text.count("\n", line_pos, pos)
+        line_pos = pos
+        results.append({"line": line_base})
+    return results
+
+
+def audit_host_write(libraries):
+    report = []
+    for library in libraries:
+        for source in _library_sources(library):
+            raw = source.read_text(encoding="utf-8", errors="ignore")
+            if "GuestWritable_nid_no_patch" not in raw:
+                continue
+            text = source_code(raw)
+            for entry in audit_host_write_text(text):
+                report.append({"library": library.name, "file": source.relative_to(ROOT).as_posix(), **entry})
+    return report
+
+
 def audit(libraries):
     report = []
     for library in libraries:
@@ -540,12 +593,25 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="List exported functions that access a guest pointer parameter directly instead of through GuestCopyIn, GuestCopyOut or the CopyGuest* helpers. A report, not a gate: it always exits 0 and does not follow a pointer passed to another function. Definitions with internal linkage are callbacks rather than exports and are left out.")
     parser.add_argument("libraries", nargs="*", help="library directories under core/libs/prx (default: all)")
     parser.add_argument("--json", action="store_true", help="print the findings as JSON")
+    parser.add_argument("--host-write", action="store_true", help="list GuestWritable_nid_no_patch calls without an enclosing GuestArena::HostWrite guard")
     args = parser.parse_args(argv)
     available = {path.name for path in PRX.iterdir() if path.is_dir() and not path.is_symlink()}
     names = args.libraries or sorted(available)
     missing = [name for name in names if name not in available]
     if missing:
         parser.error(f"not a library under core/libs/prx: {', '.join(missing)}")
+    if args.host_write:
+        report = audit_host_write([PRX / name for name in names])
+        if args.json:
+            print(json.dumps(report, indent=2))
+            return 0
+        for entry in report:
+            print(f"{entry['file']}:{entry['line']}: GuestWritable_nid_no_patch without enclosing GuestArena::HostWrite")
+        counts = Counter(entry["library"] for entry in report)
+        print(f"{len(report)} unguarded GuestWritable_nid_no_patch calls across {len({e['file'] for e in report})} files")
+        for library, count in counts.most_common():
+            print(f"  {count:5} {library}")
+        return 0
     report = audit([PRX / name for name in names])
     if args.json:
         print(json.dumps(report, indent=2))
